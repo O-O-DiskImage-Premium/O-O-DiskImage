@@ -1,0 +1,81 @@
+#!/bin/bash
+# Author: Steven Shiau <steven _at_ clonezilla org>
+# License: GPL
+# Description: This program generates nic-firmware.lst inside a chroot for Clonezilla
+
+DRBL_SCRIPT_PATH="${DRBL_SCRIPT_PATH:-/usr/share/drbl}"
+[ -e "$DRBL_SCRIPT_PATH/sbin/drbl-conf-functions" ] && . $DRBL_SCRIPT_PATH/sbin/drbl-conf-functions
+[ -e "/etc/drbl/drbl-ocs.conf" ] && . /etc/drbl/drbl-ocs.conf
+[ -e "$DRBL_SCRIPT_PATH/sbin/ocs-functions" ] && . $DRBL_SCRIPT_PATH/sbin/ocs-functions
+
+# Settings
+OUTPUT_f="nic-firmware.lst"
+out_d_def="/tmp"
+out_d="$1"
+
+[ -z "$out_d" ] && out_d=$out_d_def
+OUTPUT="$out_d/nic-firmware.lst"
+
+# Check modinfo tool
+if ! command -v modinfo >/dev/null 2>&1; then
+    echo "Error: modinfo command not found. Please install kmod."
+    exit 1
+fi
+
+# 1. Find the kernel version installed in the chroot.
+mod_base="${MODULES_DIR:-/lib/modules}"
+if [ ! -d "$mod_base" ] && [ -d "/usr/lib/modules" ]; then
+    mod_base="/usr/lib/modules"
+fi
+
+# Look for the kernel directory that contains network drivers and the most module files.
+# This avoids empty directories or partial installs.
+KVER=""
+max_mods=0
+if [ -d "$mod_base" ]; then
+    for kdir in "$mod_base"/*; do
+        [ -d "$kdir" ] || continue
+        kname="$(basename "$kdir")"
+        if [ -d "$kdir/kernel/drivers/net" ]; then
+            mod_count=$(find "$kdir/kernel/drivers/net" -type f \( -name "*.ko" -o -name "*.ko.*" \) 2>/dev/null | wc -l)
+            if [ "$mod_count" -gt "$max_mods" ]; then
+                max_mods=$mod_count
+                KVER="$kname"
+            fi
+        fi
+    done
+fi
+
+# Fallback to newest version string if module count scan didn't find any
+if [ -z "$KVER" ] && [ -d "$mod_base" ]; then
+    KVER=$(ls -1 "$mod_base" 2>/dev/null | sort -V | tail -n 1)
+fi
+
+if [ -z "$KVER" ]; then
+    echo "Error: No kernel modules found in $mod_base. Is a kernel installed?"
+    exit 1
+fi
+
+MOD_PATH="$mod_base/$KVER/kernel/drivers/net/"
+
+echo "Detected kernel version in chroot: $KVER"
+
+# 2. Start the list
+echo "# Automatically generated NIC firmware list for Clonezilla" > "$OUTPUT"
+echo "# Source Kernel: $KVER" >> "$OUTPUT"
+echo "# Generated on: $(date)" >> "$OUTPUT"
+
+# 3. Scan the network driver modules
+# We look for .ko (regular) or .ko.xz / .ko.zst (compressed) files
+if [ -d "$MOD_PATH" ]; then
+    find "$MOD_PATH" -type f \( -name "*.ko" -o -name "*.ko.*" \) -exec modinfo -F firmware {} + 2>/dev/null \
+    | sort -u >> "$OUTPUT"
+    
+    # Remove any empty lines or duplicates
+    sed -i '/^$/d' "$OUTPUT"
+    
+    echo "Successfully updated $OUTPUT with $(grep -v '^#' "$OUTPUT" | wc -l) firmware entries."
+else
+    echo "Error: Network driver path $MOD_PATH not found."
+    exit 1
+fi
